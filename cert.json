@@ -20,15 +20,13 @@
     "bidirectional": true,
     "valence": "multi",
     "routing": [
-      "unicast",
-      "fanout",
-      "broadcast-response",
-      "full-broadcast"
+      "unicast"
     ]
   },
   "last_certified": {
-    "commit": "",
-    "date": "",
-    "level": 0
-  }
+    "commit": "62cc42740a78546e3f17cef1c7eb8128ac4c1953",
+    "date": "2026-02-14",
+    "level": 1
+  },
+  "role": "client"
 }
