@@ -136,6 +136,8 @@ static void test_certification_contract(void) {
   }
   assert_eq(@"./bin/echo-server", executables[@"echo_server"], @"cert echo_server declaration");
   assert_eq(@"./bin/echo-client", executables[@"echo_client"], @"cert echo_client declaration");
+  assert_eq(@"./bin/holon-rpc-server", executables[@"holon_rpc_server"],
+            @"cert holon_rpc_server declaration");
 
   NSDictionary<NSString *, id> *capabilities = cert[@"capabilities"];
   assert_true([capabilities isKindOfClass:[NSDictionary class]], @"cert capabilities object");
@@ -145,17 +147,28 @@ static void test_certification_contract(void) {
 
   NSNumber *dialTCP = capabilities[@"grpc_dial_tcp"];
   NSNumber *dialStdio = capabilities[@"grpc_dial_stdio"];
+  NSNumber *dialUnix = capabilities[@"grpc_dial_unix"];
+  NSNumber *dialWS = capabilities[@"grpc_dial_ws"];
+  NSNumber *holonRPCServer = capabilities[@"holon_rpc_server"];
   assert_true([dialTCP isKindOfClass:[NSNumber class]] && [dialTCP boolValue],
               @"cert grpc_dial_tcp declaration");
   assert_true([dialStdio isKindOfClass:[NSNumber class]] && [dialStdio boolValue],
               @"cert grpc_dial_stdio declaration");
+  assert_true([dialUnix isKindOfClass:[NSNumber class]] && [dialUnix boolValue],
+              @"cert grpc_dial_unix declaration");
+  assert_true([dialWS isKindOfClass:[NSNumber class]] && [dialWS boolValue],
+              @"cert grpc_dial_ws declaration");
+  assert_true([holonRPCServer isKindOfClass:[NSNumber class]] && [holonRPCServer boolValue],
+              @"cert holon_rpc_server declaration");
 }
 
 static void test_echo_wrapper_scripts_exist(void) {
   assert_true(access("./bin/echo-client", F_OK) == 0, @"echo-client script exists");
   assert_true(access("./bin/echo-server", F_OK) == 0, @"echo-server script exists");
+  assert_true(access("./bin/holon-rpc-server", F_OK) == 0, @"holon-rpc-server script exists");
   assert_true(access("./bin/echo-client", X_OK) == 0, @"echo-client script executable");
   assert_true(access("./bin/echo-server", X_OK) == 0, @"echo-server script executable");
+  assert_true(access("./bin/holon-rpc-server", X_OK) == 0, @"holon-rpc-server script executable");
 }
 
 static void test_echo_wrapper_invocation(void) {
@@ -243,6 +256,35 @@ static void test_echo_wrapper_invocation(void) {
                 @"echo-server wrapper sdk default");
     assert_true([capture containsString:@"--listen"] && [capture containsString:@"stdio://"],
                 @"echo-server wrapper forwards listen URI");
+  }
+
+  serverExit = command_exit_code("./bin/echo-server serve --listen stdio:// >/dev/null 2>&1");
+  assert_true(serverExit == 0, @"echo-server wrapper serve exit");
+  capture = read_file_text(logPath);
+  assert_true(capture.length > 0, @"read echo-server wrapper serve capture");
+  if (capture.length > 0) {
+    assert_true([capture containsString:@"ARG2=serve"], @"echo-server wrapper preserves serve token");
+    assert_true([capture containsString:@"ARG3=--listen"] && [capture containsString:@"ARG4=stdio://"],
+                @"echo-server wrapper preserves serve listen flags");
+    assert_true([capture containsString:@"--sdk"] && [capture containsString:@"objc-holons"],
+                @"echo-server wrapper serve sdk default");
+  }
+
+  int holonRPCExit = command_exit_code(
+      "./bin/holon-rpc-server ws://127.0.0.1:8080/rpc >/dev/null 2>&1");
+  assert_true(holonRPCExit == 0, @"holon-rpc-server wrapper exit");
+  capture = read_file_text(logPath);
+  assert_true(capture.length > 0, @"read holon-rpc-server wrapper capture");
+  if (capture.length > 0) {
+    assert_true([capture containsString:@"PWD="] && [capture containsString:@"/sdk/go-holons"],
+                @"holon-rpc-server wrapper cwd");
+    assert_true([capture containsString:@"ARG0=run"], @"holon-rpc-server wrapper uses go run");
+    assert_true([capture containsString:@"holon-rpc-server-go/main.go"],
+                @"holon-rpc-server wrapper helper path");
+    assert_true([capture containsString:@"--sdk"] && [capture containsString:@"objc-holons"],
+                @"holon-rpc-server wrapper sdk default");
+    assert_true([capture containsString:@"ws://127.0.0.1:8080/rpc"],
+                @"holon-rpc-server wrapper forwards listen URL");
   }
 
   unlink(fakeGoTemplate);
@@ -417,6 +459,52 @@ static BOOL with_go_helper(NSString *mode, void (^block)(NSString *url)) {
   return YES;
 }
 
+static BOOL with_local_holonrpc_server(void (^block)(NSString *url)) {
+  NSPipe *stdoutPipe = [NSPipe pipe];
+  NSPipe *stderrPipe = [NSPipe pipe];
+
+  NSTask *task = [NSTask new];
+  task.launchPath = @"./bin/holon-rpc-server";
+  task.arguments = @[ @"ws://127.0.0.1:0/rpc" ];
+  task.standardOutput = stdoutPipe;
+  task.standardError = stderrPipe;
+
+  NSMutableDictionary *env = [[[NSProcessInfo processInfo] environment] mutableCopy];
+  if ([env[@"GOCACHE"] length] == 0) {
+    env[@"GOCACHE"] = @"/tmp/go-cache-objc-tests";
+  }
+  task.environment = env;
+
+  @try {
+    [task launch];
+  } @catch (NSException *exception) {
+    NSLog(@"FAIL: unable to launch local holon-rpc server: %@", exception.reason);
+    return NO;
+  }
+
+  NSString *rawURL = read_line_with_timeout(stdoutPipe.fileHandleForReading, 20.0);
+  NSString *url = [rawURL stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+  if (url.length == 0) {
+    NSData *stderrData = [stderrPipe.fileHandleForReading readDataToEndOfFile];
+    NSString *stderrText =
+        [[NSString alloc] initWithData:stderrData encoding:NSUTF8StringEncoding];
+    NSLog(@"FAIL: local holon-rpc server did not output URL: %@", stderrText ?: @"");
+    if (task.isRunning) {
+      [task terminate];
+    }
+    [task waitUntilExit];
+    return NO;
+  }
+
+  block(url);
+
+  if (task.isRunning) {
+    [task terminate];
+  }
+  [task waitUntilExit];
+  return YES;
+}
+
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
     test_certification_contract();
@@ -579,8 +667,63 @@ int main(int argc, const char *argv[]) {
     assert_true(error != nil, @"missing frontmatter error");
     [[NSFileManager defaultManager] removeItemAtPath:noFMPath error:nil];
 
+    // Certification runtime transport checks
+    if (canBindLoopback) {
+      int memExit =
+          command_exit_code("./bin/echo-client --message cert-mem mem:// >/dev/null 2>&1");
+      assert_true(memExit == 0, @"echo-client mem runtime");
+
+      int wsExit = command_exit_code(
+          "./bin/echo-client --server-sdk objc-holons --message cert-ws "
+          "ws://127.0.0.1:0/grpc >/dev/null 2>&1");
+      assert_true(wsExit == 0, @"echo-client ws runtime");
+    } else {
+      skip_test([NSString stringWithFormat:@"cert runtime transport checks skipped (%@)",
+                                           bindReason.length > 0 ? bindReason
+                                                                 : @"loopback bind unavailable"]);
+    }
+
     // Holon-RPC interop
     if (canBindLoopback) {
+      BOOL rpcLocalServer = with_local_holonrpc_server(^(NSString *url) {
+        HOLHolonRPCClient *client = [[HOLHolonRPCClient alloc]
+            initWithHeartbeatIntervalMS:250
+                     heartbeatTimeoutMS:250
+                    reconnectMinDelayMS:100
+                    reconnectMaxDelayMS:400
+                        reconnectFactor:2.0
+                        reconnectJitter:0.1
+                       connectTimeoutMS:10000
+                       requestTimeoutMS:10000];
+
+        [client registerMethod:@"client.v1.Client/Hello"
+                       handler:^NSDictionary *_Nonnull(NSDictionary<NSString *,id> *_Nonnull params) {
+                         NSString *name = [params[@"name"] isKindOfClass:[NSString class]]
+                                              ? params[@"name"]
+                                              : @"";
+                         return @{ @"message" : [NSString stringWithFormat:@"hello %@", name] };
+                       }];
+
+        NSError *rpcError = nil;
+        BOOL ok = [client connect:url error:&rpcError];
+        assert_true(ok && rpcError == nil, @"holon-rpc local server connect");
+
+        NSDictionary *ping = [client invoke:@"echo.v1.Echo/Ping"
+                                     params:@{ @"message" : @"cert-l3-holonrpc" }
+                                      error:&rpcError];
+        assert_true(ping != nil && rpcError == nil, @"holon-rpc local server ping");
+        assert_eq(@"cert-l3-holonrpc", ping[@"message"], @"holon-rpc local server ping result");
+        assert_eq(@"objc-holons", ping[@"sdk"], @"holon-rpc local server sdk");
+
+        NSDictionary *callClient =
+            invoke_eventually(client, @"echo.v1.Echo/CallClient", @{});
+        assert_true(callClient != nil, @"holon-rpc local server call-client");
+        assert_eq(@"hello objc", callClient[@"message"],
+                  @"holon-rpc local server call-client result");
+        [client close];
+      });
+      assert_true(rpcLocalServer, @"holon-rpc local server wrapper");
+
       BOOL rpcEcho = with_go_helper(@"echo", ^(NSString *url) {
         HOLHolonRPCClient *client = [[HOLHolonRPCClient alloc]
             initWithHeartbeatIntervalMS:250
