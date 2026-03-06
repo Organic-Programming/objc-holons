@@ -34,7 +34,7 @@ clang -framework Foundation -I include src/Holons.m test/holons_test.m -o test_r
 | `HOLCloseConnection(conn)` | Close connection resources |
 | `HOLScheme(uri)` | Extract transport scheme |
 | `HOLParseFlags(args)` | CLI arg extraction |
-| `HOLParseHolon(path, &error)` | Parse HOLON.md YAML frontmatter into `HOLHolonIdentity` |
+| `HOLParseHolon(path, &error)` | Parse holon.yaml into `HOLHolonIdentity` |
 | `HOLCloseListener(listener)` | Close/cleanup listener resources |
 | `HOLHolonRPCClient` | `connect(url)`, `invoke(method, params)`, `registerMethod(method, handler)`, `close()` |
 
