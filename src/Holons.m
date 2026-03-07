@@ -2,6 +2,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -37,6 +38,18 @@ static NSError *HOLMakeError(NSInteger code, NSString *message);
 @end
 
 @implementation HOLHolonIdentity
+@end
+
+@implementation HOLHolonBuild
+@end
+
+@implementation HOLHolonArtifacts
+@end
+
+@implementation HOLHolonManifest
+@end
+
+@implementation HOLHolonEntry
 @end
 
 @interface HOLPendingCall : NSObject
@@ -1240,6 +1253,215 @@ static NSArray<NSString *> *HOLYAMLList(NSString *value) {
   return items;
 }
 
+static NSString *HOLSlugifyPart(NSString *value) {
+  NSString *trimmed = [value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+  NSMutableString *slug = [NSMutableString string];
+
+  for (NSUInteger i = 0; i < trimmed.length; i++) {
+    unichar ch = [trimmed characterAtIndex:i];
+    if (ch == '?') {
+      continue;
+    }
+    if ([[NSCharacterSet whitespaceCharacterSet] characterIsMember:ch]) {
+      [slug appendString:@"-"];
+      continue;
+    }
+    NSString *piece = [[NSString stringWithCharacters:&ch length:1] lowercaseString];
+    [slug appendString:piece];
+  }
+
+  while ([slug hasSuffix:@"-"]) {
+    [slug deleteCharactersInRange:NSMakeRange(slug.length - 1, 1)];
+  }
+  return slug;
+}
+
+static NSString *HOLSlugFromIdentity(HOLHolonIdentity *identity) {
+  NSString *given = HOLSlugifyPart(identity.givenName ?: @"");
+  NSString *family = HOLSlugifyPart(identity.familyName ?: @"");
+  if (given.length == 0) {
+    return family;
+  }
+  if (family.length == 0) {
+    return given;
+  }
+  return [NSString stringWithFormat:@"%@-%@", given, family];
+}
+
+static HOLHolonManifest *HOLParseManifest(NSString *path, NSError **error) {
+  NSError *readError = nil;
+  NSString *text = [NSString stringWithContentsOfFile:path
+                                             encoding:NSUTF8StringEncoding
+                                                error:&readError];
+  if (text == nil) {
+    if (error != NULL) {
+      *error = readError;
+    }
+    return nil;
+  }
+
+  NSArray<NSString *> *lines =
+      [text componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+  HOLHolonManifest *manifest = [HOLHolonManifest new];
+  manifest.kind = @"";
+  manifest.build = [HOLHolonBuild new];
+  manifest.build.runner = @"";
+  manifest.build.main = @"";
+  manifest.artifacts = [HOLHolonArtifacts new];
+  manifest.artifacts.binary = @"";
+  manifest.artifacts.primary = @"";
+
+  BOOL sawMapping = NO;
+  BOOL sawManifestValue = NO;
+  NSString *section = nil;
+
+  for (NSString *rawLine in lines) {
+    NSUInteger indent = [rawLine rangeOfCharacterFromSet:
+                                     [[NSCharacterSet whitespaceCharacterSet] invertedSet]]
+                             .location;
+    if (indent == NSNotFound) {
+      continue;
+    }
+
+    NSString *line = [rawLine stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    if (line.length == 0 || [line hasPrefix:@"#"]) {
+      continue;
+    }
+
+    NSRange colon = [line rangeOfString:@":"];
+    if (colon.location == NSNotFound) {
+      continue;
+    }
+
+    sawMapping = YES;
+    NSString *key = [line substringToIndex:colon.location];
+    NSString *value = HOLYAMLValue(line);
+
+    if (indent == 0) {
+      section = nil;
+      if ([key isEqualToString:@"kind"]) {
+        manifest.kind = value;
+        sawManifestValue = YES;
+      } else if (([key isEqualToString:@"build"] || [key isEqualToString:@"artifacts"]) &&
+                 value.length == 0) {
+        section = key;
+      }
+      continue;
+    }
+
+    if ([section isEqualToString:@"build"]) {
+      if ([key isEqualToString:@"runner"]) {
+        manifest.build.runner = value;
+        sawManifestValue = YES;
+      } else if ([key isEqualToString:@"main"]) {
+        manifest.build.main = value;
+        sawManifestValue = YES;
+      }
+    } else if ([section isEqualToString:@"artifacts"]) {
+      if ([key isEqualToString:@"binary"]) {
+        manifest.artifacts.binary = value;
+        sawManifestValue = YES;
+      } else if ([key isEqualToString:@"primary"]) {
+        manifest.artifacts.primary = value;
+        sawManifestValue = YES;
+      }
+    }
+  }
+
+  if (!sawMapping) {
+    if (error != NULL) {
+      *error = HOLMakeError(20, [NSString stringWithFormat:@"%@: holon.yaml must be a YAML mapping", path]);
+    }
+    return nil;
+  }
+
+  return sawManifestValue ? manifest : nil;
+}
+
+static NSString *HOLResolveDiscoveryRoot(NSString *root) {
+  NSString *candidate = root;
+  if (candidate.length == 0) {
+    candidate = [[NSFileManager defaultManager] currentDirectoryPath];
+  } else if (![candidate isAbsolutePath]) {
+    candidate = [[[NSFileManager defaultManager] currentDirectoryPath]
+        stringByAppendingPathComponent:candidate];
+  }
+  return [[candidate stringByStandardizingPath] stringByResolvingSymlinksInPath];
+}
+
+static NSString *HOLRelativePathFromRoot(NSString *root, NSString *path) {
+  if ([path isEqualToString:root]) {
+    return @".";
+  }
+
+  NSString *prefix = [root hasSuffix:@"/"] ? root : [root stringByAppendingString:@"/"];
+  if ([path hasPrefix:prefix]) {
+    NSString *relative = [path substringFromIndex:prefix.length];
+    return relative.length > 0 ? relative : @".";
+  }
+  return path;
+}
+
+static BOOL HOLShouldSkipDiscoveryDir(NSString *name) {
+  if ([name isEqualToString:@".git"] || [name isEqualToString:@".op"] ||
+      [name isEqualToString:@"node_modules"] || [name isEqualToString:@"vendor"] ||
+      [name isEqualToString:@"build"]) {
+    return YES;
+  }
+  return [name hasPrefix:@"."];
+}
+
+static NSUInteger HOLRelativePathDepth(NSString *relativePath) {
+  if (relativePath.length == 0 || [relativePath isEqualToString:@"."]) {
+    return 0;
+  }
+  return (NSUInteger)[[relativePath pathComponents] count];
+}
+
+static NSString *HOLOPPath(void) {
+  const char *configured = getenv("OPPATH");
+  if (configured != NULL && configured[0] != '\0') {
+    return HOLResolveDiscoveryRoot([NSString stringWithUTF8String:configured]);
+  }
+
+  const char *home = getenv("HOME");
+  if (home != NULL && home[0] != '\0') {
+    return HOLResolveDiscoveryRoot([[NSString stringWithUTF8String:home]
+        stringByAppendingPathComponent:@".op"]);
+  }
+  return HOLResolveDiscoveryRoot(@".op");
+}
+
+static NSString *HOLOPBin(void) {
+  const char *configured = getenv("OPBIN");
+  if (configured != NULL && configured[0] != '\0') {
+    return HOLResolveDiscoveryRoot([NSString stringWithUTF8String:configured]);
+  }
+  return [[HOLOPPath() stringByAppendingPathComponent:@"bin"] stringByStandardizingPath];
+}
+
+static NSString *HOLCacheDir(void) {
+  return [[HOLOPPath() stringByAppendingPathComponent:@"cache"] stringByStandardizingPath];
+}
+
+static void HOLAppendOrReplaceEntry(NSMutableArray<HOLHolonEntry *> *entries,
+                                    NSMutableDictionary<NSString *, NSNumber *> *indexByKey,
+                                    HOLHolonEntry *candidate) {
+  NSString *key = candidate.uuid.length > 0 ? candidate.uuid : candidate.dir;
+  NSNumber *existingIndex = indexByKey[key];
+  if (existingIndex != nil) {
+    NSUInteger idx = (NSUInteger)[existingIndex unsignedIntegerValue];
+    HOLHolonEntry *existing = entries[idx];
+    if (HOLRelativePathDepth(candidate.relativePath) < HOLRelativePathDepth(existing.relativePath)) {
+      entries[idx] = candidate;
+    }
+    return;
+  }
+
+  indexByKey[key] = @(entries.count);
+  [entries addObject:candidate];
+}
+
 HOLHolonIdentity *HOLParseHolon(NSString *path, NSError **error) {
   NSError *readError = nil;
   NSString *text = [NSString stringWithContentsOfFile:path
@@ -1319,6 +1541,144 @@ HOLHolonIdentity *HOLParseHolon(NSString *path, NSError **error) {
   }
 
   return identity;
+}
+
+static NSArray<HOLHolonEntry *> *HOLDiscoverWithOrigin(NSString *root,
+                                                       NSString *origin,
+                                                       NSError **error) {
+  NSString *resolvedRoot = HOLResolveDiscoveryRoot(root);
+  BOOL isDirectory = NO;
+  if (![[NSFileManager defaultManager] fileExistsAtPath:resolvedRoot isDirectory:&isDirectory] ||
+      !isDirectory) {
+    return @[];
+  }
+
+  NSURL *rootURL = [NSURL fileURLWithPath:resolvedRoot isDirectory:YES];
+  NSDirectoryEnumerator<NSURL *> *enumerator =
+      [[NSFileManager defaultManager] enumeratorAtURL:rootURL
+                          includingPropertiesForKeys:@[ NSURLIsDirectoryKey ]
+                                             options:0
+                                        errorHandler:^BOOL(NSURL *url, NSError *enumeratorError) {
+                                          (void)url;
+                                          (void)enumeratorError;
+                                          return YES;
+                                        }];
+  if (enumerator == nil) {
+    if (error != NULL) {
+      *error = HOLMakeError(21, [NSString stringWithFormat:@"cannot enumerate %@", resolvedRoot]);
+    }
+    return nil;
+  }
+
+  NSMutableArray<HOLHolonEntry *> *entries = [NSMutableArray array];
+  NSMutableDictionary<NSString *, NSNumber *> *indexByKey = [NSMutableDictionary dictionary];
+
+  for (NSURL *url in enumerator) {
+    NSNumber *isDirValue = nil;
+    [url getResourceValue:&isDirValue forKey:NSURLIsDirectoryKey error:nil];
+
+    if (isDirValue.boolValue) {
+      if (HOLShouldSkipDiscoveryDir(url.lastPathComponent)) {
+        [enumerator skipDescendants];
+      }
+      continue;
+    }
+
+    if (![url.lastPathComponent isEqualToString:@"holon.yaml"]) {
+      continue;
+    }
+
+    NSString *manifestPath = [[[url path] stringByStandardizingPath] stringByResolvingSymlinksInPath];
+    HOLHolonIdentity *identity = HOLParseHolon(manifestPath, nil);
+    if (identity == nil) {
+      continue;
+    }
+
+    NSString *dirPath = [[[manifestPath stringByDeletingLastPathComponent] stringByStandardizingPath]
+        stringByResolvingSymlinksInPath];
+    HOLHolonEntry *entry = [HOLHolonEntry new];
+    entry.slug = HOLSlugFromIdentity(identity);
+    entry.uuid = identity.uuid ?: @"";
+    entry.dir = dirPath;
+    entry.relativePath = HOLRelativePathFromRoot(resolvedRoot, dirPath);
+    entry.origin = origin;
+    entry.identity = identity;
+    entry.manifest = HOLParseManifest(manifestPath, nil);
+    HOLAppendOrReplaceEntry(entries, indexByKey, entry);
+  }
+
+  return [entries sortedArrayUsingComparator:^NSComparisonResult(HOLHolonEntry *left,
+                                                                 HOLHolonEntry *right) {
+    NSComparisonResult rel = [left.relativePath compare:right.relativePath];
+    if (rel != NSOrderedSame) {
+      return rel;
+    }
+    return [left.uuid compare:right.uuid];
+  }];
+}
+
+NSArray<HOLHolonEntry *> *HOLDiscover(NSString *root, NSError **error) {
+  return HOLDiscoverWithOrigin(root, @"local", error);
+}
+
+NSArray<HOLHolonEntry *> *HOLDiscoverLocal(NSError **error) {
+  return HOLDiscoverWithOrigin([[NSFileManager defaultManager] currentDirectoryPath], @"local", error);
+}
+
+NSArray<HOLHolonEntry *> *HOLDiscoverAll(NSError **error) {
+  NSMutableArray<HOLHolonEntry *> *entries = [NSMutableArray array];
+  NSMutableDictionary<NSString *, NSNumber *> *indexByKey = [NSMutableDictionary dictionary];
+
+  NSArray<NSArray<NSString *> *> *roots = @[
+    @[ [[NSFileManager defaultManager] currentDirectoryPath], @"local" ],
+    @[ HOLOPBin(), @"$OPBIN" ],
+    @[ HOLCacheDir(), @"cache" ],
+  ];
+
+  for (NSArray<NSString *> *pair in roots) {
+    NSArray<HOLHolonEntry *> *found = HOLDiscoverWithOrigin(pair[0], pair[1], error);
+    if (found == nil) {
+      return nil;
+    }
+    for (HOLHolonEntry *entry in found) {
+      HOLAppendOrReplaceEntry(entries, indexByKey, entry);
+    }
+  }
+
+  return [entries sortedArrayUsingComparator:^NSComparisonResult(HOLHolonEntry *left,
+                                                                 HOLHolonEntry *right) {
+    NSComparisonResult rel = [left.relativePath compare:right.relativePath];
+    if (rel != NSOrderedSame) {
+      return rel;
+    }
+    return [left.uuid compare:right.uuid];
+  }];
+}
+
+HOLHolonEntry *HOLFindBySlug(NSString *slug, NSError **error) {
+  NSArray<HOLHolonEntry *> *entries = HOLDiscoverAll(error);
+  if (entries == nil) {
+    return nil;
+  }
+  for (HOLHolonEntry *entry in entries) {
+    if ([entry.slug isEqualToString:slug]) {
+      return entry;
+    }
+  }
+  return nil;
+}
+
+HOLHolonEntry *HOLFindByUUID(NSString *prefix, NSError **error) {
+  NSArray<HOLHolonEntry *> *entries = HOLDiscoverAll(error);
+  if (entries == nil) {
+    return nil;
+  }
+  for (HOLHolonEntry *entry in entries) {
+    if ([entry.uuid hasPrefix:prefix]) {
+      return entry;
+    }
+  }
+  return nil;
 }
 
 void HOLCloseListener(HOLTransportListener *listener) {

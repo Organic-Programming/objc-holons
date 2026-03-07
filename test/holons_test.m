@@ -111,6 +111,47 @@ static void restore_env(NSString *name, NSString *value) {
   }
 }
 
+static NSString *make_temp_dir(NSString *prefix) {
+  NSString *path = [NSTemporaryDirectory()
+      stringByAppendingPathComponent:[NSString stringWithFormat:@"%@%@", prefix,
+                                                               [[NSUUID UUID] UUIDString]]];
+  [[NSFileManager defaultManager] createDirectoryAtPath:path
+                            withIntermediateDirectories:YES
+                                             attributes:nil
+                                                  error:nil];
+  return path;
+}
+
+static void write_discovery_holon(NSString *dir,
+                                  NSString *uuid,
+                                  NSString *givenName,
+                                  NSString *familyName,
+                                  NSString *binary) {
+  [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                            withIntermediateDirectories:YES
+                                             attributes:nil
+                                                  error:nil];
+  NSString *path = [dir stringByAppendingPathComponent:@"holon.yaml"];
+  NSString *content =
+      [NSString stringWithFormat:
+                    @"schema: holon/v0\n"
+                     "uuid: \"%@\"\n"
+                     "given_name: \"%@\"\n"
+                     "family_name: \"%@\"\n"
+                     "motto: \"Test\"\n"
+                     "composer: \"test\"\n"
+                     "clade: deterministic/pure\n"
+                     "status: draft\n"
+                     "born: \"2026-03-07\"\n"
+                     "kind: native\n"
+                     "build:\n"
+                     "  runner: go-module\n"
+                     "artifacts:\n"
+                     "  binary: %@\n",
+                    uuid, givenName, familyName, binary];
+  [content writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
 static BOOL loopback_bind_allowed(NSString **reasonOut) {
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) {
@@ -655,6 +696,65 @@ int main(int argc, const char *argv[]) {
     assert_true(noFM == nil, @"invalid mapping fails");
     assert_true(error != nil, @"invalid mapping error");
     [[NSFileManager defaultManager] removeItemAtPath:noFMPath error:nil];
+
+    NSString *discoverRoot = make_temp_dir(@"objc_holons_discover_");
+    NSString *opRoot = make_temp_dir(@"objc_holons_op_");
+    write_discovery_holon([discoverRoot stringByAppendingPathComponent:@"holons/alpha"],
+                          @"uuid-alpha", @"Alpha", @"Go", @"alpha-go");
+    write_discovery_holon([discoverRoot stringByAppendingPathComponent:@"nested/beta"],
+                          @"uuid-beta", @"Beta", @"Rust", @"beta-rust");
+    write_discovery_holon([discoverRoot stringByAppendingPathComponent:@"nested/dup/alpha"],
+                          @"uuid-alpha", @"Alpha", @"Go", @"alpha-go");
+    write_discovery_holon([discoverRoot stringByAppendingPathComponent:@".git/hidden"],
+                          @"uuid-hidden", @"Ignored", @"Holon", @"ignored");
+    write_discovery_holon([discoverRoot stringByAppendingPathComponent:@"node_modules/x"],
+                          @"uuid-node", @"Ignored", @"Node", @"ignored");
+    write_discovery_holon([opRoot stringByAppendingPathComponent:@"bin/gamma"], @"uuid-gamma",
+                          @"Gamma", @"Bin", @"gamma-bin");
+    write_discovery_holon([opRoot stringByAppendingPathComponent:@"cache/delta"], @"uuid-delta",
+                          @"Delta", @"Cache", @"delta-cache");
+
+    error = nil;
+    NSArray<HOLHolonEntry *> *discovered = HOLDiscover(discoverRoot, &error);
+    assert_true(discovered != nil && error == nil, @"discover success");
+    assert_true(discovered.count == 2, @"discover entry count");
+    if (discovered.count == 2) {
+      HOLHolonEntry *alpha = discovered[0];
+      HOLHolonEntry *beta = discovered[1];
+      assert_eq(@"alpha-go", alpha.slug, @"discover alpha slug");
+      assert_eq(@"holons/alpha", alpha.relativePath, @"discover shallowest path");
+      assert_true(alpha.manifest != nil, @"discover manifest present");
+      assert_eq(@"go-module", alpha.manifest.build.runner, @"discover manifest runner");
+      assert_eq(@"beta-rust", beta.slug, @"discover beta slug");
+    }
+
+    NSString *previousCwd = [[NSFileManager defaultManager] currentDirectoryPath];
+    NSString *previousOPPATH = env_string(@"OPPATH");
+    NSString *previousOPBIN = env_string(@"OPBIN");
+    [[NSFileManager defaultManager] changeCurrentDirectoryPath:discoverRoot];
+    setenv("OPPATH", opRoot.UTF8String, 1);
+    unsetenv("OPBIN");
+
+    error = nil;
+    NSArray<HOLHolonEntry *> *discoveredAll = HOLDiscoverAll(&error);
+    assert_true(discoveredAll != nil && error == nil, @"discoverAll success");
+    assert_true(discoveredAll.count == 4, @"discoverAll entry count");
+
+    error = nil;
+    HOLHolonEntry *bySlug = HOLFindBySlug(@"alpha-go", &error);
+    assert_true(bySlug != nil && error == nil, @"findBySlug success");
+    assert_eq(@"uuid-alpha", bySlug.uuid, @"findBySlug uuid");
+
+    error = nil;
+    HOLHolonEntry *byUUID = HOLFindByUUID(@"uuid-d", &error);
+    assert_true(byUUID != nil && error == nil, @"findByUUID success");
+    assert_eq(@"cache", byUUID.origin, @"findByUUID origin");
+
+    [[NSFileManager defaultManager] changeCurrentDirectoryPath:previousCwd];
+    restore_env(@"OPPATH", previousOPPATH);
+    restore_env(@"OPBIN", previousOPBIN);
+    [[NSFileManager defaultManager] removeItemAtPath:discoverRoot error:nil];
+    [[NSFileManager defaultManager] removeItemAtPath:opRoot error:nil];
 
     // Certification runtime transport checks
     if (canBindLoopback) {

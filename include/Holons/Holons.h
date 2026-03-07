@@ -110,6 +110,32 @@ typedef NSDictionary<NSString *, id> *_Nonnull (^HOLHolonRPCHandler)(
 @property(nonatomic, copy) NSArray<NSString *> *aliases;
 @end
 
+@interface HOLHolonBuild : NSObject
+@property(nonatomic, copy) NSString *runner;
+@property(nonatomic, copy) NSString *main;
+@end
+
+@interface HOLHolonArtifacts : NSObject
+@property(nonatomic, copy) NSString *binary;
+@property(nonatomic, copy) NSString *primary;
+@end
+
+@interface HOLHolonManifest : NSObject
+@property(nonatomic, copy) NSString *kind;
+@property(nonatomic, strong) HOLHolonBuild *build;
+@property(nonatomic, strong) HOLHolonArtifacts *artifacts;
+@end
+
+@interface HOLHolonEntry : NSObject
+@property(nonatomic, copy) NSString *slug;
+@property(nonatomic, copy) NSString *uuid;
+@property(nonatomic, copy) NSString *dir;
+@property(nonatomic, copy) NSString *relativePath;
+@property(nonatomic, copy) NSString *origin;
+@property(nonatomic, strong) HOLHolonIdentity *identity;
+@property(nonatomic, strong, nullable) HOLHolonManifest *manifest;
+@end
+
 /// Extract the scheme from a transport URI.
 NSString *HOLScheme(NSString *uri);
 
@@ -142,6 +168,22 @@ NSString *HOLParseFlags(NSArray<NSString *> *args);
 /// Parse a holon.yaml identity mapping.
 HOLHolonIdentity *_Nullable HOLParseHolon(NSString *path,
                                           NSError *_Nullable *_Nullable error);
+
+/// Discover holons under a filesystem root.
+NSArray<HOLHolonEntry *> *_Nullable HOLDiscover(NSString *root,
+                                                NSError *_Nullable *_Nullable error);
+
+/// Discover holons from the current working directory.
+NSArray<HOLHolonEntry *> *_Nullable HOLDiscoverLocal(NSError *_Nullable *_Nullable error);
+
+/// Discover holons from the current working directory, $OPBIN, and cache.
+NSArray<HOLHolonEntry *> *_Nullable HOLDiscoverAll(NSError *_Nullable *_Nullable error);
+
+/// Find a holon by slug across local, $OPBIN, and cache search roots.
+HOLHolonEntry *_Nullable HOLFindBySlug(NSString *slug, NSError *_Nullable *_Nullable error);
+
+/// Find a holon by UUID prefix across local, $OPBIN, and cache search roots.
+HOLHolonEntry *_Nullable HOLFindByUUID(NSString *prefix, NSError *_Nullable *_Nullable error);
 
 /// Close any open descriptors associated with a listener.
 void HOLCloseListener(HOLTransportListener *listener);
