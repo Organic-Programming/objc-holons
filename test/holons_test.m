@@ -49,6 +49,13 @@ static NSString *read_file_text(NSString *path) {
   return text;
 }
 
+static NSString *trim_string(NSString *value) {
+  if (value == nil) {
+    return @"";
+  }
+  return [value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
+
 static int command_exit_code(const char *cmd) {
   int status = system(cmd);
   if (status == -1 || !WIFEXITED(status)) {
@@ -539,6 +546,347 @@ static BOOL with_local_holonrpc_server(void (^block)(NSString *url)) {
   return YES;
 }
 
+static NSString *find_objc_sdk_root(void) {
+  NSString *sdkDir = find_sdk_dir();
+  if (sdkDir.length == 0) {
+    return nil;
+  }
+  return [sdkDir stringByAppendingPathComponent:@"objc-holons"];
+}
+
+static NSString *write_executable_script(NSString *dir, NSString *name, NSString *content) {
+  [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                            withIntermediateDirectories:YES
+                                             attributes:nil
+                                                  error:nil];
+  NSString *path = [dir stringByAppendingPathComponent:name];
+  if (![content writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil]) {
+    return nil;
+  }
+  if (chmod(path.UTF8String, 0700) != 0) {
+    return nil;
+  }
+  return path;
+}
+
+static BOOL pid_exists(pid_t pid) {
+  if (pid <= 0) {
+    return NO;
+  }
+  int rc = kill(pid, 0);
+  return rc == 0 || errno == EPERM;
+}
+
+static BOOL wait_for_pid_exit(pid_t pid, NSTimeInterval timeout) {
+  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+  while ([deadline timeIntervalSinceNow] > 0) {
+    if (!pid_exists(pid)) {
+      return YES;
+    }
+    [NSThread sleepForTimeInterval:0.025];
+  }
+  return !pid_exists(pid);
+}
+
+static int reserve_loopback_port(void) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) {
+    return -1;
+  }
+
+  int one = 1;
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons((uint16_t)0);
+  inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+  if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+    close(fd);
+    return -1;
+  }
+
+  socklen_t len = sizeof(addr);
+  if (getsockname(fd, (struct sockaddr *)&addr, &len) != 0) {
+    close(fd);
+    return -1;
+  }
+
+  int port = (int)ntohs(addr.sin_port);
+  close(fd);
+  return port;
+}
+
+static BOOL with_echo_server_tcp(void (^block)(NSString *target, NSTask *task)) {
+  NSString *sdkRoot = find_objc_sdk_root();
+  if (sdkRoot.length == 0) {
+    NSLog(@"FAIL: unable to locate objc-holons SDK root");
+    return NO;
+  }
+
+  NSString *serverPath = [sdkRoot stringByAppendingPathComponent:@"bin/echo-server"];
+  NSPipe *stdoutPipe = [NSPipe pipe];
+  NSPipe *stderrPipe = [NSPipe pipe];
+
+  NSTask *task = [NSTask new];
+  task.launchPath = serverPath;
+  task.arguments = @[ @"--listen", @"tcp://127.0.0.1:0" ];
+  task.standardOutput = stdoutPipe;
+  task.standardError = stderrPipe;
+
+  NSMutableDictionary *env = [[[NSProcessInfo processInfo] environment] mutableCopy];
+  if ([env[@"GOCACHE"] length] == 0) {
+    env[@"GOCACHE"] = @"/tmp/go-cache-objc-tests";
+  }
+  task.environment = env;
+
+  @try {
+    [task launch];
+  } @catch (NSException *exception) {
+    NSLog(@"FAIL: unable to launch echo-server: %@", exception.reason);
+    return NO;
+  }
+
+  NSString *rawTarget = read_line_with_timeout(stdoutPipe.fileHandleForReading, 20.0);
+  NSString *target =
+      [rawTarget stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+  if ([target hasPrefix:@"tcp://"]) {
+    target = [target substringFromIndex:6];
+  }
+
+  if (target.length == 0) {
+    NSData *stderrData = [stderrPipe.fileHandleForReading readDataToEndOfFile];
+    NSString *stderrText =
+        [[NSString alloc] initWithData:stderrData encoding:NSUTF8StringEncoding];
+    NSLog(@"FAIL: echo-server did not advertise a target: %@", stderrText ?: @"");
+    if (task.isRunning) {
+      [task terminate];
+    }
+    [task waitUntilExit];
+    return NO;
+  }
+
+  block(target, task);
+
+  if (task.isRunning) {
+    [task terminate];
+  }
+  [task waitUntilExit];
+  return YES;
+}
+
+static void test_connect_direct_target(void) {
+  BOOL ok = with_echo_server_tcp(^(NSString *target, NSTask *task) {
+    GRPCChannel *channel = [Holons connect:target];
+    assert_true(channel != nil, @"connect direct target returns channel");
+    if (channel != nil) {
+      assert_eq(target, channel.target, @"connect direct target normalizes target");
+      assert_eq(@"tcp", channel.transport, @"connect direct target transport");
+      [Holons disconnect:channel];
+      assert_true(task.isRunning, @"connect direct disconnect leaves server running");
+    }
+  });
+  assert_true(ok, @"connect direct target helper");
+}
+
+static void test_connect_slug_starts_ephemeral_stdio(void) {
+  NSString *tmpRoot = make_temp_dir(@"objc_holons_connect_stdio_");
+  NSString *pidFile = [tmpRoot stringByAppendingPathComponent:@"stdio.pid"];
+  NSString *script = [NSString stringWithFormat:
+                                    @"#!/usr/bin/env bash\n"
+                                     "set -euo pipefail\n"
+                                     "PID_FILE=%@\n"
+                                     "cleanup() {\n"
+                                     "  rm -f \"$PID_FILE\"\n"
+                                     "}\n"
+                                     "printf '%%s\\n' \"$$\" > \"$PID_FILE\"\n"
+                                     "trap cleanup EXIT INT TERM\n"
+                                     "if [[ \"${1:-}\" == \"serve\" && \"${2:-}\" == \"--listen\" && \"${3:-}\" == \"stdio://\" ]]; then\n"
+                                     "  while IFS= read -r _; do :; done\n"
+                                     "  exit 0\n"
+                                     "fi\n"
+                                     "sleep 60\n",
+                                    pidFile];
+  NSString *scriptPath = write_executable_script(tmpRoot, @"stdio-holon.sh", script);
+  assert_true(scriptPath.length > 0, @"write stdio holon script");
+  if (scriptPath.length == 0) {
+    return;
+  }
+
+  NSString *slug = @"connect-stdio";
+  write_discovery_holon([tmpRoot stringByAppendingPathComponent:@"holons/connect-stdio"],
+                        @"uuid-connect-stdio", @"Connect", @"Stdio", scriptPath);
+
+  NSString *previousCwd = [[NSFileManager defaultManager] currentDirectoryPath];
+  [[NSFileManager defaultManager] changeCurrentDirectoryPath:tmpRoot];
+
+  GRPCChannel *channel = [Holons connect:slug];
+  assert_true(channel != nil, @"connect stdio slug returns channel");
+  if (channel != nil) {
+    assert_eq(@"stdio://", channel.target, @"connect stdio slug target");
+    assert_eq(@"stdio", channel.transport, @"connect stdio slug transport");
+
+    NSString *pidText = trim_string(read_file_text(pidFile));
+    pid_t pid = (pid_t)[pidText intValue];
+    assert_true(pid > 0 && pid_exists(pid), @"connect stdio slug started process");
+
+    NSString *portFile = [tmpRoot stringByAppendingPathComponent:@".op/run/connect-stdio.port"];
+    assert_true(access(portFile.UTF8String, F_OK) != 0, @"connect stdio slug does not write port file");
+
+    [Holons disconnect:channel];
+    assert_true(wait_for_pid_exit(pid, 2.0), @"disconnect stdio slug stops ephemeral process");
+    assert_true(access(pidFile.UTF8String, F_OK) != 0, @"disconnect stdio slug removes pid file");
+  }
+
+  [[NSFileManager defaultManager] changeCurrentDirectoryPath:previousCwd];
+  [[NSFileManager defaultManager] removeItemAtPath:tmpRoot error:nil];
+}
+
+static void test_connect_writes_and_reuses_port_file(void) {
+  NSString *sdkRoot = find_objc_sdk_root();
+  assert_true(sdkRoot.length > 0, @"locate objc sdk root");
+  if (sdkRoot.length == 0) {
+    return;
+  }
+
+  NSString *tmpRoot = make_temp_dir(@"objc_holons_connect_tcp_");
+  NSString *pidFile = [tmpRoot stringByAppendingPathComponent:@"tcp-wrapper.pid"];
+  NSString *echoServer = [sdkRoot stringByAppendingPathComponent:@"bin/echo-server"];
+  NSString *script = [NSString stringWithFormat:
+                                    @"#!/usr/bin/env bash\n"
+                                     "set -euo pipefail\n"
+                                     "PID_FILE=%@\n"
+                                     "SERVER=%@\n"
+                                     "child=''\n"
+                                     "cleanup() {\n"
+                                     "  rm -f \"$PID_FILE\"\n"
+                                     "  if [[ -n \"$child\" ]] && kill -0 \"$child\" >/dev/null 2>&1; then\n"
+                                     "    kill -TERM \"$child\" >/dev/null 2>&1 || true\n"
+                                     "    wait \"$child\" >/dev/null 2>&1 || true\n"
+                                     "  fi\n"
+                                     "}\n"
+                                     "printf '%%s\\n' \"$$\" > \"$PID_FILE\"\n"
+                                     "trap cleanup EXIT INT TERM\n"
+                                     "\"$SERVER\" \"$@\" &\n"
+                                     "child=$!\n"
+                                     "wait \"$child\"\n",
+                                    pidFile, echoServer];
+  NSString *scriptPath = write_executable_script(tmpRoot, @"tcp-wrapper.sh", script);
+  assert_true(scriptPath.length > 0, @"write tcp wrapper script");
+  if (scriptPath.length == 0) {
+    return;
+  }
+
+  NSString *slug = @"connect-persistent";
+  write_discovery_holon([tmpRoot stringByAppendingPathComponent:@"holons/connect-persistent"],
+                        @"uuid-connect-persistent", @"Connect", @"Persistent", scriptPath);
+
+  NSString *previousCwd = [[NSFileManager defaultManager] currentDirectoryPath];
+  [[NSFileManager defaultManager] changeCurrentDirectoryPath:tmpRoot];
+
+  HolonsConnectOptions *options = [HolonsConnectOptions new];
+  options.transport = @"tcp";
+  options.start = YES;
+
+  GRPCChannel *channel = [Holons connect:slug options:options];
+  assert_true(channel != nil, @"connect tcp slug returns channel");
+  if (channel != nil) {
+    assert_eq(@"tcp", channel.transport, @"connect tcp slug transport");
+
+    NSString *pidText = trim_string(read_file_text(pidFile));
+    pid_t wrapperPID = (pid_t)[pidText intValue];
+    assert_true(wrapperPID > 0 && pid_exists(wrapperPID), @"connect tcp slug started wrapper");
+
+    NSString *portFile = [tmpRoot stringByAppendingPathComponent:@".op/run/connect-persistent.port"];
+    NSString *portTarget = trim_string(read_file_text(portFile));
+    assert_true([portTarget hasPrefix:@"tcp://127.0.0.1:"], @"connect tcp slug writes port file");
+
+    [Holons disconnect:channel];
+    assert_true(pid_exists(wrapperPID), @"disconnect persistent slug leaves process running");
+
+    GRPCChannel *reused = [Holons connect:slug];
+    assert_true(reused != nil, @"connect reuses existing port file");
+    if (reused != nil) {
+      assert_eq(channel.target, reused.target, @"connect reused channel target");
+      [Holons disconnect:reused];
+      assert_true(pid_exists(wrapperPID), @"disconnect reused direct channel leaves process running");
+    }
+
+    kill(wrapperPID, SIGTERM);
+    assert_true(wait_for_pid_exit(wrapperPID, 2.0), @"manual stop ends persistent wrapper");
+  }
+
+  [[NSFileManager defaultManager] changeCurrentDirectoryPath:previousCwd];
+  [[NSFileManager defaultManager] removeItemAtPath:tmpRoot error:nil];
+}
+
+static void test_connect_removes_stale_port_file(void) {
+  NSString *tmpRoot = make_temp_dir(@"objc_holons_connect_stale_");
+  NSString *pidFile = [tmpRoot stringByAppendingPathComponent:@"stale.pid"];
+  NSString *script = [NSString stringWithFormat:
+                                    @"#!/usr/bin/env bash\n"
+                                     "set -euo pipefail\n"
+                                     "PID_FILE=%@\n"
+                                     "cleanup() {\n"
+                                     "  rm -f \"$PID_FILE\"\n"
+                                     "}\n"
+                                     "printf '%%s\\n' \"$$\" > \"$PID_FILE\"\n"
+                                     "trap cleanup EXIT INT TERM\n"
+                                     "if [[ \"${1:-}\" == \"serve\" && \"${2:-}\" == \"--listen\" && \"${3:-}\" == \"stdio://\" ]]; then\n"
+                                     "  while IFS= read -r _; do :; done\n"
+                                     "  exit 0\n"
+                                     "fi\n"
+                                     "sleep 60\n",
+                                    pidFile];
+  NSString *scriptPath = write_executable_script(tmpRoot, @"stale-holon.sh", script);
+  assert_true(scriptPath.length > 0, @"write stale holon script");
+  if (scriptPath.length == 0) {
+    return;
+  }
+
+  NSString *slug = @"connect-stale";
+  write_discovery_holon([tmpRoot stringByAppendingPathComponent:@"holons/connect-stale"],
+                        @"uuid-connect-stale", @"Connect", @"Stale", scriptPath);
+
+  NSString *previousCwd = [[NSFileManager defaultManager] currentDirectoryPath];
+  [[NSFileManager defaultManager] changeCurrentDirectoryPath:tmpRoot];
+
+  int stalePort = reserve_loopback_port();
+  if (stalePort <= 0) {
+    skip_test(@"connect stale slug skipped (loopback bind unavailable)");
+    [[NSFileManager defaultManager] changeCurrentDirectoryPath:previousCwd];
+    [[NSFileManager defaultManager] removeItemAtPath:tmpRoot error:nil];
+    return;
+  }
+  assert_true(stalePort > 0, @"reserve stale loopback port");
+
+  NSString *portFile = [tmpRoot stringByAppendingPathComponent:@".op/run/connect-stale.port"];
+  [[NSFileManager defaultManager] createDirectoryAtPath:[portFile stringByDeletingLastPathComponent]
+                            withIntermediateDirectories:YES
+                                             attributes:nil
+                                                  error:nil];
+  [[NSString stringWithFormat:@"tcp://127.0.0.1:%d\n", stalePort]
+      writeToFile:portFile
+       atomically:YES
+         encoding:NSUTF8StringEncoding
+            error:nil];
+
+  GRPCChannel *channel = [Holons connect:slug];
+  assert_true(channel != nil, @"connect stale slug returns channel");
+  if (channel != nil) {
+    NSString *pidText = trim_string(read_file_text(pidFile));
+    pid_t pid = (pid_t)[pidText intValue];
+    assert_true(pid > 0 && pid_exists(pid), @"connect stale slug starts fresh process");
+    assert_true(access(portFile.UTF8String, F_OK) != 0, @"connect stale slug removes stale port file");
+    [Holons disconnect:channel];
+    assert_true(wait_for_pid_exit(pid, 2.0), @"disconnect stale slug stops fresh process");
+  }
+
+  [[NSFileManager defaultManager] changeCurrentDirectoryPath:previousCwd];
+  [[NSFileManager defaultManager] removeItemAtPath:tmpRoot error:nil];
+}
+
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
     test_echo_wrapper_scripts_exist();
@@ -755,6 +1103,18 @@ int main(int argc, const char *argv[]) {
     restore_env(@"OPBIN", previousOPBIN);
     [[NSFileManager defaultManager] removeItemAtPath:discoverRoot error:nil];
     [[NSFileManager defaultManager] removeItemAtPath:opRoot error:nil];
+
+    // Connect
+    test_connect_slug_starts_ephemeral_stdio();
+    test_connect_removes_stale_port_file();
+    if (canBindLoopback) {
+      test_connect_direct_target();
+      test_connect_writes_and_reuses_port_file();
+    } else {
+      skip_test([NSString stringWithFormat:@"connect tcp checks skipped (%@)",
+                                           bindReason.length > 0 ? bindReason
+                                                                 : @"loopback bind unavailable"]);
+    }
 
     // Certification runtime transport checks
     if (canBindLoopback) {

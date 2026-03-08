@@ -58,6 +58,11 @@ extern NSString *const HOLDefaultURI;
 @property(nonatomic, assign) BOOL ownsWriteFD;
 @end
 
+@interface GRPCChannel : NSObject
+@property(nonatomic, copy, readonly) NSString *target;
+@property(nonatomic, copy, readonly) NSString *transport;
+@end
+
 typedef NSDictionary<NSString *, id> *_Nonnull (^HOLHolonRPCHandler)(
     NSDictionary<NSString *, id> *_Nonnull params);
 
@@ -134,6 +139,19 @@ typedef NSDictionary<NSString *, id> *_Nonnull (^HOLHolonRPCHandler)(
 @property(nonatomic, copy) NSString *origin;
 @property(nonatomic, strong) HOLHolonIdentity *identity;
 @property(nonatomic, strong, nullable) HOLHolonManifest *manifest;
+@end
+
+@interface HolonsConnectOptions : NSObject
+@property(nonatomic) NSTimeInterval timeout;
+@property(nonatomic, copy) NSString *transport;
+@property(nonatomic) BOOL start;
+@property(nonatomic, copy, nullable) NSString *portFile;
+@end
+
+@interface Holons : NSObject
++ (nullable GRPCChannel *)connect:(NSString *)target;
++ (nullable GRPCChannel *)connect:(NSString *)target options:(HolonsConnectOptions *)options;
++ (void)disconnect:(nullable GRPCChannel *)channel;
 @end
 
 /// Extract the scheme from a transport URI.

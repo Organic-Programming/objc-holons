@@ -1,9 +1,12 @@
 #import <Holons/Holons.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -11,7 +14,9 @@
 
 NSString *const HOLDefaultURI = @"tcp://:9090";
 static NSString *const HOLErrorDomain = @"org.organicprogramming.holons";
+static const NSTimeInterval HOLDefaultConnectTimeout = 5.0;
 static NSError *HOLMakeError(NSInteger code, NSString *message);
+static NSMutableDictionary<NSString *, id> *HOLStartedChannels(void);
 
 @implementation HOLParsedURI
 @end
@@ -37,6 +42,46 @@ static NSError *HOLMakeError(NSInteger code, NSString *message);
 @implementation HOLConnection
 @end
 
+@interface GRPCChannel ()
+@property(nonatomic, copy, readwrite) NSString *target;
+@property(nonatomic, copy, readwrite) NSString *transport;
+@property(nonatomic, strong, nullable) NSTask *task;
+@property(nonatomic, strong, nullable) NSPipe *stdinPipe;
+@property(nonatomic, strong, nullable) NSPipe *stdoutPipe;
+@property(nonatomic, strong, nullable) NSPipe *stderrPipe;
+@property(nonatomic, assign) BOOL closed;
+- (instancetype)initWithTarget:(NSString *)target
+                     transport:(NSString *)transport
+                          task:(NSTask *_Nullable)task
+                     stdinPipe:(NSPipe *_Nullable)stdinPipe
+                    stdoutPipe:(NSPipe *_Nullable)stdoutPipe
+                    stderrPipe:(NSPipe *_Nullable)stderrPipe;
+@end
+
+@implementation GRPCChannel
+
+- (instancetype)initWithTarget:(NSString *)target
+                     transport:(NSString *)transport
+                          task:(NSTask *)task
+                     stdinPipe:(NSPipe *)stdinPipe
+                    stdoutPipe:(NSPipe *)stdoutPipe
+                    stderrPipe:(NSPipe *)stderrPipe {
+  self = [super init];
+  if (!self) {
+    return nil;
+  }
+  _target = [target copy] ?: @"";
+  _transport = [transport copy] ?: @"";
+  _task = task;
+  _stdinPipe = stdinPipe;
+  _stdoutPipe = stdoutPipe;
+  _stderrPipe = stderrPipe;
+  _closed = NO;
+  return self;
+}
+
+@end
+
 @implementation HOLHolonIdentity
 @end
 
@@ -50,6 +95,30 @@ static NSError *HOLMakeError(NSInteger code, NSString *message);
 @end
 
 @implementation HOLHolonEntry
+@end
+
+@implementation HolonsConnectOptions
+
+- (instancetype)init {
+  self = [super init];
+  if (!self) {
+    return nil;
+  }
+  _timeout = HOLDefaultConnectTimeout;
+  _transport = @"stdio";
+  _start = YES;
+  _portFile = nil;
+  return self;
+}
+
+@end
+
+@interface HOLStartedChannel : NSObject
+@property(nonatomic, strong, nullable) NSTask *task;
+@property(nonatomic, assign) BOOL ephemeral;
+@end
+
+@implementation HOLStartedChannel
 @end
 
 @interface HOLPendingCall : NSObject
@@ -1713,3 +1782,740 @@ void HOLCloseListener(HOLTransportListener *listener) {
     }
   }
 }
+
+static NSMutableDictionary<NSString *, id> *HOLStartedChannels(void) {
+  static NSMutableDictionary<NSString *, id> *channels = nil;
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    channels = [NSMutableDictionary dictionary];
+  });
+  return channels;
+}
+
+static NSString *HOLTrimmedString(NSString *value) {
+  if (value == nil) {
+    return @"";
+  }
+  return [value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
+
+static NSString *HOLChannelKey(GRPCChannel *channel) {
+  return [NSString stringWithFormat:@"%p", channel];
+}
+
+static BOOL HOLIsDirectTarget(NSString *target) {
+  NSString *trimmed = HOLTrimmedString(target);
+  if (trimmed.length == 0) {
+    return NO;
+  }
+  if ([trimmed containsString:@"://"]) {
+    return YES;
+  }
+  return [trimmed containsString:@":"];
+}
+
+static NSString *HOLTransportForTarget(NSString *target) {
+  NSString *trimmed = HOLTrimmedString(target);
+  if (trimmed.length == 0) {
+    return @"";
+  }
+  if ([trimmed containsString:@"://"]) {
+    return [HOLScheme(trimmed) lowercaseString];
+  }
+  return [trimmed containsString:@":"] ? @"tcp" : @"";
+}
+
+static NSString *HOLNormalizeDialTarget(NSString *target) {
+  NSString *trimmed = HOLTrimmedString(target);
+  if (trimmed.length == 0) {
+    return @"";
+  }
+  if (![trimmed containsString:@"://"]) {
+    HOLParsedURI *parsed = HOLParseURI([@"tcp://" stringByAppendingString:trimmed]);
+    NSString *host = parsed.host;
+    if (host.length == 0 || [host isEqualToString:@"0.0.0.0"] || [host isEqualToString:@"::"] ||
+        [host isEqualToString:@"[::]"]) {
+      host = @"127.0.0.1";
+    }
+    if (parsed.port == nil) {
+      return trimmed;
+    }
+    return [NSString stringWithFormat:@"%@:%d", host, parsed.port.intValue];
+  }
+
+  HOLParsedURI *parsed = HOLParseURI(trimmed);
+  if ([parsed.scheme isEqualToString:@"tcp"]) {
+    NSString *host = parsed.host;
+    if (host.length == 0 || [host isEqualToString:@"0.0.0.0"] || [host isEqualToString:@"::"] ||
+        [host isEqualToString:@"[::]"]) {
+      host = @"127.0.0.1";
+    }
+    if (parsed.port == nil) {
+      return trimmed;
+    }
+    return [NSString stringWithFormat:@"%@:%d", host, parsed.port.intValue];
+  }
+
+  return trimmed;
+}
+
+static NSString *HOLNormalizeEndpointURI(NSString *target) {
+  NSString *trimmed = HOLTrimmedString(target);
+  if (trimmed.length == 0) {
+    return @"";
+  }
+  if (![trimmed containsString:@"://"]) {
+    NSString *dialTarget = HOLNormalizeDialTarget(trimmed);
+    return dialTarget.length > 0 ? [@"tcp://" stringByAppendingString:dialTarget] : @"";
+  }
+
+  HOLParsedURI *parsed = HOLParseURI(trimmed);
+  if ([parsed.scheme isEqualToString:@"tcp"]) {
+    NSString *host = parsed.host;
+    if (host.length == 0 || [host isEqualToString:@"0.0.0.0"] || [host isEqualToString:@"::"] ||
+        [host isEqualToString:@"[::]"]) {
+      host = @"127.0.0.1";
+    }
+    if (parsed.port == nil) {
+      return trimmed;
+    }
+    return [NSString stringWithFormat:@"tcp://%@:%d", host, parsed.port.intValue];
+  }
+
+  return trimmed;
+}
+
+static BOOL HOLWaitForConnectResult(int fd, NSTimeInterval timeout) {
+  fd_set writeSet;
+  FD_ZERO(&writeSet);
+  FD_SET(fd, &writeSet);
+
+  struct timeval tv;
+  tv.tv_sec = (int)timeout;
+  tv.tv_usec = (int)((timeout - floor(timeout)) * 1000000.0);
+
+  int rc = select(fd + 1, NULL, &writeSet, NULL, timeout >= 0 ? &tv : NULL);
+  if (rc <= 0) {
+    return NO;
+  }
+
+  int soError = 0;
+  socklen_t len = sizeof(soError);
+  if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soError, &len) != 0) {
+    return NO;
+  }
+  return soError == 0;
+}
+
+static BOOL HOLCanConnectTCP(NSString *host, int port, NSTimeInterval timeout) {
+  NSString *resolvedHost = HOLTrimmedString(host);
+  if (resolvedHost.length == 0 || [resolvedHost isEqualToString:@"0.0.0.0"] ||
+      [resolvedHost isEqualToString:@"::"] || [resolvedHost isEqualToString:@"[::]"]) {
+    resolvedHost = @"127.0.0.1";
+  }
+  if (port <= 0) {
+    return NO;
+  }
+
+  struct addrinfo hints;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+
+  char portText[32];
+  snprintf(portText, sizeof(portText), "%d", port);
+
+  struct addrinfo *results = NULL;
+  if (getaddrinfo(resolvedHost.UTF8String, portText, &hints, &results) != 0) {
+    return NO;
+  }
+
+  BOOL connected = NO;
+  for (struct addrinfo *it = results; it != NULL; it = it->ai_next) {
+    int fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+    if (fd < 0) {
+      continue;
+    }
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) {
+      fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
+
+    int rc = connect(fd, it->ai_addr, (socklen_t)it->ai_addrlen);
+    if (rc == 0) {
+      connected = YES;
+    } else if (errno == EINPROGRESS || errno == EWOULDBLOCK) {
+      connected = HOLWaitForConnectResult(fd, timeout);
+    }
+
+    close(fd);
+    if (connected) {
+      break;
+    }
+  }
+
+  freeaddrinfo(results);
+  return connected;
+}
+
+static BOOL HOLCanConnectUnix(NSString *path, NSTimeInterval timeout) {
+  NSString *trimmedPath = HOLTrimmedString(path);
+  if (trimmedPath.length == 0 || trimmedPath.length >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
+    return NO;
+  }
+
+  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (fd < 0) {
+    return NO;
+  }
+
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags >= 0) {
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+  }
+
+  struct sockaddr_un addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  strncpy(addr.sun_path, trimmedPath.UTF8String, sizeof(addr.sun_path) - 1);
+
+  BOOL connected = NO;
+  int rc = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+  if (rc == 0) {
+    connected = YES;
+  } else if (errno == EINPROGRESS || errno == EWOULDBLOCK) {
+    connected = HOLWaitForConnectResult(fd, timeout);
+  }
+
+  close(fd);
+  return connected;
+}
+
+static BOOL HOLCanDialTarget(NSString *target, NSTimeInterval timeout) {
+  NSString *trimmed = HOLTrimmedString(target);
+  if (trimmed.length == 0) {
+    return NO;
+  }
+
+  NSString *transport = HOLTransportForTarget(trimmed);
+  if ([transport isEqualToString:@"tcp"]) {
+    HOLParsedURI *parsed = [trimmed containsString:@"://"] ? HOLParseURI(trimmed)
+                                                            : HOLParseURI([@"tcp://"
+                                                                              stringByAppendingString:trimmed]);
+    NSString *host = parsed.host;
+    if (host.length == 0 || [host isEqualToString:@"0.0.0.0"] || [host isEqualToString:@"::"] ||
+        [host isEqualToString:@"[::]"]) {
+      host = @"127.0.0.1";
+    }
+    return HOLCanConnectTCP(host, parsed.port != nil ? parsed.port.intValue : 0, timeout);
+  }
+
+  if ([transport isEqualToString:@"unix"]) {
+    HOLParsedURI *parsed = HOLParseURI(trimmed);
+    return HOLCanConnectUnix(parsed.path ?: @"", timeout);
+  }
+
+  return NO;
+}
+
+static NSString *HOLDefaultPortFilePath(NSString *slug) {
+  NSString *cwd = [[NSFileManager defaultManager] currentDirectoryPath];
+  return [[cwd stringByAppendingPathComponent:@".op/run"]
+      stringByAppendingPathComponent:[slug stringByAppendingString:@".port"]];
+}
+
+static BOOL HOLWritePortFile(NSString *path, NSString *uri) {
+  NSString *trimmedPath = HOLTrimmedString(path);
+  NSString *trimmedURI = HOLTrimmedString(uri);
+  if (trimmedPath.length == 0 || trimmedURI.length == 0) {
+    return NO;
+  }
+
+  NSError *error = nil;
+  NSString *dir = [trimmedPath stringByDeletingLastPathComponent];
+  if (![[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                 withIntermediateDirectories:YES
+                                                  attributes:nil
+                                                       error:&error]) {
+    return NO;
+  }
+
+  NSString *content = [trimmedURI stringByAppendingString:@"\n"];
+  return [content writeToFile:trimmedPath
+                   atomically:YES
+                     encoding:NSUTF8StringEncoding
+                        error:&error];
+}
+
+static NSString *HOLUsablePortFile(NSString *path, NSTimeInterval timeout) {
+  NSString *trimmedPath = HOLTrimmedString(path);
+  if (trimmedPath.length == 0) {
+    return nil;
+  }
+
+  NSError *error = nil;
+  NSString *content = [NSString stringWithContentsOfFile:trimmedPath
+                                                encoding:NSUTF8StringEncoding
+                                                   error:&error];
+  if (content == nil) {
+    return nil;
+  }
+
+  NSString *uri = HOLTrimmedString(content);
+  if (uri.length == 0) {
+    [[NSFileManager defaultManager] removeItemAtPath:trimmedPath error:nil];
+    return nil;
+  }
+
+  NSTimeInterval checkTimeout = timeout / 4.0;
+  if (checkTimeout <= 0) {
+    checkTimeout = 0.25;
+  }
+  if (checkTimeout > 1.0) {
+    checkTimeout = 1.0;
+  }
+
+  if (HOLCanDialTarget(uri, checkTimeout)) {
+    return HOLNormalizeEndpointURI(uri);
+  }
+
+  [[NSFileManager defaultManager] removeItemAtPath:trimmedPath error:nil];
+  return nil;
+}
+
+static NSString *HOLExecutableOnPath(NSString *name) {
+  NSString *trimmed = HOLTrimmedString(name);
+  if (trimmed.length == 0) {
+    return nil;
+  }
+
+  NSString *pathEnv = [[[NSProcessInfo processInfo] environment] objectForKey:@"PATH"] ?: @"";
+  for (NSString *dir in [pathEnv componentsSeparatedByString:@":"]) {
+    if (dir.length == 0) {
+      continue;
+    }
+    NSString *candidate = [[dir stringByAppendingPathComponent:trimmed] stringByStandardizingPath];
+    if ([[NSFileManager defaultManager] isExecutableFileAtPath:candidate]) {
+      return candidate;
+    }
+  }
+  return nil;
+}
+
+static NSString *HOLResolveBinaryPathForEntry(HOLHolonEntry *entry) {
+  if (entry.manifest == nil) {
+    return nil;
+  }
+
+  NSString *name = HOLTrimmedString(entry.manifest.artifacts.binary);
+  if (name.length == 0) {
+    return nil;
+  }
+
+  NSFileManager *fm = [NSFileManager defaultManager];
+  if ([name isAbsolutePath] && [fm isExecutableFileAtPath:name]) {
+    return [[name stringByStandardizingPath] stringByResolvingSymlinksInPath];
+  }
+
+  NSString *relativeCandidate = [[entry.dir stringByAppendingPathComponent:name] stringByStandardizingPath];
+  if ([fm isExecutableFileAtPath:relativeCandidate]) {
+    return [relativeCandidate stringByResolvingSymlinksInPath];
+  }
+
+  NSString *builtCandidate =
+      [[[entry.dir stringByAppendingPathComponent:@".op/build/bin"] stringByAppendingPathComponent:[name lastPathComponent]]
+          stringByStandardizingPath];
+  if ([fm isExecutableFileAtPath:builtCandidate]) {
+    return [builtCandidate stringByResolvingSymlinksInPath];
+  }
+
+  return HOLExecutableOnPath([name lastPathComponent]);
+}
+
+static void HOLRememberChannel(GRPCChannel *channel, NSTask *task, BOOL ephemeral) {
+  if (channel == nil || task == nil) {
+    return;
+  }
+  HOLStartedChannel *handle = [HOLStartedChannel new];
+  handle.task = task;
+  handle.ephemeral = ephemeral;
+  @synchronized(HOLStartedChannels()) {
+    HOLStartedChannels()[HOLChannelKey(channel)] = handle;
+  }
+}
+
+static void HOLCloseFileHandle(NSFileHandle *handle) {
+  if (handle == nil) {
+    return;
+  }
+  @try {
+    [handle closeFile];
+  } @catch (NSException *exception) {
+    (void)exception;
+  }
+}
+
+static void HOLCloseChannel(GRPCChannel *channel) {
+  if (channel == nil || channel.closed) {
+    return;
+  }
+  channel.closed = YES;
+  HOLCloseFileHandle(channel.stdinPipe.fileHandleForWriting);
+  HOLCloseFileHandle(channel.stdoutPipe.fileHandleForReading);
+  HOLCloseFileHandle(channel.stderrPipe.fileHandleForReading);
+}
+
+static void HOLStopTask(NSTask *task) {
+  if (task == nil) {
+    return;
+  }
+  if (!task.isRunning) {
+    @try {
+      [task waitUntilExit];
+    } @catch (NSException *exception) {
+      (void)exception;
+    }
+    return;
+  }
+
+  @try {
+    [task terminate];
+  } @catch (NSException *exception) {
+    (void)exception;
+  }
+
+  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:2.0];
+  while (task.isRunning && [deadline timeIntervalSinceNow] > 0) {
+    [NSThread sleepForTimeInterval:0.025];
+  }
+
+  if (task.isRunning) {
+    @try {
+      [task interrupt];
+    } @catch (NSException *exception) {
+      (void)exception;
+    }
+  }
+
+  NSDate *interruptDeadline = [NSDate dateWithTimeIntervalSinceNow:0.25];
+  while (task.isRunning && [interruptDeadline timeIntervalSinceNow] > 0) {
+    [NSThread sleepForTimeInterval:0.025];
+  }
+}
+
+static NSTask *HOLLaunchTask(NSString *binaryPath,
+                             NSArray<NSString *> *arguments,
+                             NSPipe **stdinPipeOut,
+                             NSPipe **stdoutPipeOut,
+                             NSPipe **stderrPipeOut) {
+  NSString *launchPath = HOLTrimmedString(binaryPath);
+  if (launchPath.length == 0) {
+    return nil;
+  }
+
+  NSPipe *stdinPipe = [NSPipe pipe];
+  NSPipe *stdoutPipe = [NSPipe pipe];
+  NSPipe *stderrPipe = [NSPipe pipe];
+
+  NSTask *task = [NSTask new];
+  task.launchPath = launchPath;
+  task.arguments = arguments ?: @[];
+  task.standardInput = stdinPipe;
+  task.standardOutput = stdoutPipe;
+  task.standardError = stderrPipe;
+  task.environment = [[NSProcessInfo processInfo] environment];
+
+  @try {
+    [task launch];
+  } @catch (NSException *exception) {
+    (void)exception;
+    return nil;
+  }
+
+  if (stdinPipeOut != NULL) {
+    *stdinPipeOut = stdinPipe;
+  }
+  if (stdoutPipeOut != NULL) {
+    *stdoutPipeOut = stdoutPipe;
+  }
+  if (stderrPipeOut != NULL) {
+    *stderrPipeOut = stderrPipe;
+  }
+  return task;
+}
+
+static NSString *HOLFirstURI(NSString *line) {
+  NSString *trimmedLine = HOLTrimmedString(line);
+  if (trimmedLine.length == 0) {
+    return nil;
+  }
+
+  NSArray<NSString *> *fields =
+      [trimmedLine componentsSeparatedByCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+  NSCharacterSet *trimSet =
+      [NSCharacterSet characterSetWithCharactersInString:@"\"'()[]{}.,"];
+  for (NSString *field in fields) {
+    NSString *token = [field stringByTrimmingCharactersInSet:trimSet];
+    if ([token hasPrefix:@"tcp://"] || [token hasPrefix:@"unix://"] ||
+        [token hasPrefix:@"ws://"] || [token hasPrefix:@"wss://"] ||
+        [token hasPrefix:@"stdio://"]) {
+      return token;
+    }
+  }
+  return nil;
+}
+
+static void HOLScanPipeForURI(NSPipe *pipe, NSObject *lock, NSMutableDictionary *state) {
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+    @autoreleasepool {
+      NSFileHandle *handle = pipe.fileHandleForReading;
+      NSMutableData *buffer = [NSMutableData data];
+
+      while (YES) {
+        NSData *chunk = [handle readDataOfLength:1];
+        if (chunk.length == 0) {
+          break;
+        }
+
+        uint8_t byte = ((const uint8_t *)chunk.bytes)[0];
+        if (byte == '\n' || byte == '\r') {
+          if (buffer.length > 0) {
+            NSString *line = [[NSString alloc] initWithData:buffer encoding:NSUTF8StringEncoding];
+            NSString *uri = HOLFirstURI(line);
+            if (uri.length > 0) {
+              @synchronized(lock) {
+                if ([state[@"uri"] length] == 0) {
+                  state[@"uri"] = [uri copy];
+                }
+              }
+              return;
+            }
+            [buffer setLength:0];
+          }
+          continue;
+        }
+
+        [buffer appendData:chunk];
+      }
+
+      if (buffer.length > 0) {
+        NSString *line = [[NSString alloc] initWithData:buffer encoding:NSUTF8StringEncoding];
+        NSString *uri = HOLFirstURI(line);
+        if (uri.length > 0) {
+          @synchronized(lock) {
+            if ([state[@"uri"] length] == 0) {
+              state[@"uri"] = [uri copy];
+            }
+          }
+        }
+      }
+    }
+  });
+}
+
+static NSString *HOLReadAdvertisedURI(NSTask *task,
+                                      NSPipe *stdoutPipe,
+                                      NSPipe *stderrPipe,
+                                      NSTimeInterval timeout) {
+  NSObject *lock = [NSObject new];
+  NSMutableDictionary *state = [NSMutableDictionary dictionary];
+
+  HOLScanPipeForURI(stdoutPipe, lock, state);
+  HOLScanPipeForURI(stderrPipe, lock, state);
+
+  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+  while ([deadline timeIntervalSinceNow] > 0) {
+    @synchronized(lock) {
+      if ([state[@"uri"] length] > 0) {
+        return [state[@"uri"] copy];
+      }
+    }
+    if (!task.isRunning) {
+      break;
+    }
+    [NSThread sleepForTimeInterval:0.05];
+  }
+
+  @synchronized(lock) {
+    return [state[@"uri"] copy];
+  }
+}
+
+static GRPCChannel *HOLDialDirectTarget(NSString *target, NSTimeInterval timeout) {
+  NSString *dialTarget = HOLNormalizeDialTarget(target);
+  if (dialTarget.length == 0) {
+    return nil;
+  }
+  if (!HOLCanDialTarget(target, timeout)) {
+    return nil;
+  }
+  return [[GRPCChannel alloc] initWithTarget:dialTarget
+                                   transport:HOLTransportForTarget(target)
+                                        task:nil
+                                   stdinPipe:nil
+                                  stdoutPipe:nil
+                                  stderrPipe:nil];
+}
+
+static GRPCChannel *HOLStartStdioHolon(NSString *binaryPath, NSTimeInterval timeout, BOOL ephemeral) {
+  NSPipe *stdinPipe = nil;
+  NSPipe *stdoutPipe = nil;
+  NSPipe *stderrPipe = nil;
+  NSTask *task = HOLLaunchTask(binaryPath, @[ @"serve", @"--listen", @"stdio://" ],
+                               &stdinPipe, &stdoutPipe, &stderrPipe);
+  if (task == nil) {
+    return nil;
+  }
+
+  NSDate *deadline =
+      [NSDate dateWithTimeIntervalSinceNow:timeout > 0 ? MIN(timeout, 0.2) : 0.1];
+  while ([deadline timeIntervalSinceNow] > 0 && task.isRunning) {
+    [NSThread sleepForTimeInterval:0.01];
+  }
+
+  if (!task.isRunning) {
+    HOLCloseFileHandle(stdinPipe.fileHandleForWriting);
+    HOLCloseFileHandle(stdoutPipe.fileHandleForReading);
+    HOLCloseFileHandle(stderrPipe.fileHandleForReading);
+    return nil;
+  }
+
+  GRPCChannel *channel = [[GRPCChannel alloc] initWithTarget:@"stdio://"
+                                                   transport:@"stdio"
+                                                        task:task
+                                                   stdinPipe:stdinPipe
+                                                  stdoutPipe:stdoutPipe
+                                                  stderrPipe:stderrPipe];
+  HOLRememberChannel(channel, task, ephemeral);
+  return channel;
+}
+
+static GRPCChannel *HOLStartTCPHolon(NSString *binaryPath,
+                                     NSTimeInterval timeout,
+                                     NSString *portFile,
+                                     BOOL ephemeral) {
+  NSPipe *stdinPipe = nil;
+  NSPipe *stdoutPipe = nil;
+  NSPipe *stderrPipe = nil;
+  NSTask *task = HOLLaunchTask(binaryPath, @[ @"serve", @"--listen", @"tcp://127.0.0.1:0" ],
+                               &stdinPipe, &stdoutPipe, &stderrPipe);
+  if (task == nil) {
+    return nil;
+  }
+
+  NSString *advertisedURI = HOLReadAdvertisedURI(task, stdoutPipe, stderrPipe, timeout);
+  NSString *normalizedURI = HOLNormalizeEndpointURI(advertisedURI);
+  if (normalizedURI.length == 0 || !HOLCanDialTarget(normalizedURI, timeout)) {
+    HOLStopTask(task);
+    HOLCloseFileHandle(stdinPipe.fileHandleForWriting);
+    HOLCloseFileHandle(stdoutPipe.fileHandleForReading);
+    HOLCloseFileHandle(stderrPipe.fileHandleForReading);
+    return nil;
+  }
+
+  if (!ephemeral && !HOLWritePortFile(portFile, normalizedURI)) {
+    HOLStopTask(task);
+    HOLCloseFileHandle(stdinPipe.fileHandleForWriting);
+    HOLCloseFileHandle(stdoutPipe.fileHandleForReading);
+    HOLCloseFileHandle(stderrPipe.fileHandleForReading);
+    return nil;
+  }
+
+  GRPCChannel *channel = [[GRPCChannel alloc] initWithTarget:HOLNormalizeDialTarget(normalizedURI)
+                                                   transport:@"tcp"
+                                                        task:task
+                                                   stdinPipe:stdinPipe
+                                                  stdoutPipe:stdoutPipe
+                                                  stderrPipe:stderrPipe];
+  HOLRememberChannel(channel, task, ephemeral);
+  return channel;
+}
+
+static GRPCChannel *HOLConnectInternal(NSString *target,
+                                       HolonsConnectOptions *options,
+                                       BOOL ephemeral) {
+  NSString *trimmedTarget = HOLTrimmedString(target);
+  if (trimmedTarget.length == 0) {
+    return nil;
+  }
+
+  HolonsConnectOptions *resolvedOptions = options ?: [HolonsConnectOptions new];
+  NSTimeInterval timeout = resolvedOptions.timeout > 0 ? resolvedOptions.timeout
+                                                       : HOLDefaultConnectTimeout;
+
+  if (HOLIsDirectTarget(trimmedTarget)) {
+    return HOLDialDirectTarget(trimmedTarget, timeout);
+  }
+
+  NSString *transport = [[HOLTrimmedString(resolvedOptions.transport) lowercaseString] copy];
+  if (transport.length == 0) {
+    transport = @"stdio";
+  }
+  if (![transport isEqualToString:@"stdio"] && ![transport isEqualToString:@"tcp"]) {
+    return nil;
+  }
+
+  NSString *portFile = HOLTrimmedString(resolvedOptions.portFile);
+  if (portFile.length == 0) {
+    portFile = HOLDefaultPortFilePath(trimmedTarget);
+  }
+
+  NSError *error = nil;
+  HOLHolonEntry *entry = HOLFindBySlug(trimmedTarget, &error);
+  if (entry == nil) {
+    return nil;
+  }
+
+  NSString *reusedURI = HOLUsablePortFile(portFile, timeout);
+  if (reusedURI.length > 0) {
+    return HOLDialDirectTarget(reusedURI, timeout);
+  }
+  if (!resolvedOptions.start) {
+    return nil;
+  }
+
+  NSString *binaryPath = HOLResolveBinaryPathForEntry(entry);
+  if (binaryPath.length == 0) {
+    return nil;
+  }
+
+  if ([transport isEqualToString:@"stdio"]) {
+    if (!ephemeral) {
+      return nil;
+    }
+    return HOLStartStdioHolon(binaryPath, timeout, YES);
+  }
+
+  return HOLStartTCPHolon(binaryPath, timeout, portFile, ephemeral);
+}
+
+@implementation Holons
+
++ (GRPCChannel *)connect:(NSString *)target {
+  return HOLConnectInternal(target, nil, YES);
+}
+
++ (GRPCChannel *)connect:(NSString *)target options:(HolonsConnectOptions *)options {
+  return HOLConnectInternal(target, options, NO);
+}
+
++ (void)disconnect:(GRPCChannel *)channel {
+  if (channel == nil) {
+    return;
+  }
+
+  HOLStartedChannel *handle = nil;
+  @synchronized(HOLStartedChannels()) {
+    handle = HOLStartedChannels()[HOLChannelKey(channel)];
+    [HOLStartedChannels() removeObjectForKey:HOLChannelKey(channel)];
+  }
+
+  HOLCloseChannel(channel);
+
+  if (handle.ephemeral) {
+    HOLStopTask(handle.task);
+  }
+}
+
+@end
