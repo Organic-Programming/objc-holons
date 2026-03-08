@@ -159,6 +159,50 @@ static void write_discovery_holon(NSString *dir,
   [content writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
+static void write_echo_holon(NSString *root) {
+  NSString *protoDir = [root stringByAppendingPathComponent:@"protos/echo/v1"];
+  [[NSFileManager defaultManager] createDirectoryAtPath:protoDir
+                            withIntermediateDirectories:YES
+                                             attributes:nil
+                                                  error:nil];
+
+  NSString *holonYAML = [root stringByAppendingPathComponent:@"holon.yaml"];
+  [@"given_name: Echo\n"
+    "family_name: Server\n"
+    "motto: Reply precisely.\n"
+      writeToFile:holonYAML
+       atomically:YES
+         encoding:NSUTF8StringEncoding
+            error:nil];
+
+  NSString *protoPath = [protoDir stringByAppendingPathComponent:@"echo.proto"];
+  NSString *proto =
+      @"syntax = \"proto3\";\n"
+       "package echo.v1;\n\n"
+       "// Echo echoes request payloads for documentation tests.\n"
+       "service Echo {\n"
+       "  // Ping echoes the inbound message.\n"
+       "  // @example {\"message\":\"hello\",\"sdk\":\"go-holons\"}\n"
+       "  rpc Ping(PingRequest) returns (PingResponse);\n"
+       "}\n\n"
+       "message PingRequest {\n"
+       "  // Message to echo back.\n"
+       "  // @required\n"
+       "  // @example \"hello\"\n"
+       "  string message = 1;\n\n"
+       "  // SDK marker included in the response.\n"
+       "  // @example \"go-holons\"\n"
+       "  string sdk = 2;\n"
+       "}\n\n"
+       "message PingResponse {\n"
+       "  // Echoed message.\n"
+       "  string message = 1;\n\n"
+       "  // SDK marker from the server.\n"
+       "  string sdk = 2;\n"
+       "}\n";
+  [proto writeToFile:protoPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
 static BOOL loopback_bind_allowed(NSString **reasonOut) {
   int fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) {
@@ -1044,6 +1088,80 @@ int main(int argc, const char *argv[]) {
     assert_true(noFM == nil, @"invalid mapping fails");
     assert_true(error != nil, @"invalid mapping error");
     [[NSFileManager defaultManager] removeItemAtPath:noFMPath error:nil];
+
+    // Describe
+    NSString *describeRoot = make_temp_dir(@"objc_holons_describe_");
+    write_echo_holon(describeRoot);
+    error = nil;
+    HOLDescribeResponse *describe =
+        HOLBuildDescribeResponse([describeRoot stringByAppendingPathComponent:@"protos"],
+                                 [describeRoot stringByAppendingPathComponent:@"holon.yaml"],
+                                 &error);
+    assert_true(describe != nil && error == nil, @"describe build response");
+    if (describe != nil) {
+      assert_eq(@"echo-server", describe.slug, @"describe slug");
+      assert_eq(@"Reply precisely.", describe.motto, @"describe motto");
+      assert_true(describe.services.count == 1, @"describe service count");
+      HOLServiceDoc *service = describe.services.firstObject;
+      assert_eq(@"echo.v1.Echo", service.name, @"describe service name");
+      assert_eq(@"Echo echoes request payloads for documentation tests.",
+                service.docDescription,
+                @"describe service description");
+      assert_true(service.methods.count == 1, @"describe method count");
+      HOLMethodDoc *method = service.methods.firstObject;
+      assert_eq(@"Ping", method.name, @"describe method name");
+      assert_eq(@"Ping echoes the inbound message.", method.docDescription,
+                @"describe method description");
+      assert_eq(@"echo.v1.PingRequest", method.inputType, @"describe input type");
+      assert_eq(@"echo.v1.PingResponse", method.outputType, @"describe output type");
+      assert_eq(@"{\"message\":\"hello\",\"sdk\":\"go-holons\"}", method.exampleInput,
+                @"describe example input");
+      assert_true(method.inputFields.count == 2, @"describe input field count");
+      HOLFieldDoc *field = method.inputFields.firstObject;
+      assert_eq(@"message", field.name, @"describe field name");
+      assert_eq(@"string", field.type, @"describe field type");
+      assert_true(field.number == 1, @"describe field number");
+      assert_eq(@"Message to echo back.", field.docDescription,
+                @"describe field description");
+      assert_true(field.label == HOLFieldLabelRequired, @"describe field label");
+      assert_true(field.required, @"describe field required");
+      assert_eq(@"\"hello\"", field.example, @"describe field example");
+    }
+
+    HOLHolonMetaRegistration *registration =
+        HOLMakeHolonMetaRegistration([describeRoot stringByAppendingPathComponent:@"protos"],
+                                     [describeRoot stringByAppendingPathComponent:@"holon.yaml"]);
+    assert_eq(@"holonmeta.v1.HolonMeta", registration.serviceName,
+              @"describe registration service");
+    assert_eq(@"Describe", registration.methodName, @"describe registration method");
+    HOLDescribeResponse *registered = registration.handler([HOLDescribeRequest new]);
+    assert_true(registered != nil, @"describe registration handler");
+    if (registered != nil) {
+      assert_true(registered.services.count == 1, @"describe registration services");
+    }
+    [[NSFileManager defaultManager] removeItemAtPath:describeRoot error:nil];
+
+    NSString *emptyDescribeRoot = make_temp_dir(@"objc_holons_describe_empty_");
+    NSString *emptyHolon = [emptyDescribeRoot stringByAppendingPathComponent:@"holon.yaml"];
+    [@"given_name: Empty\n"
+      "family_name: Holon\n"
+      "motto: Still available.\n"
+        writeToFile:emptyHolon
+         atomically:YES
+           encoding:NSUTF8StringEncoding
+              error:nil];
+    error = nil;
+    HOLDescribeResponse *emptyDescribe =
+        HOLBuildDescribeResponse([emptyDescribeRoot stringByAppendingPathComponent:@"protos"],
+                                 emptyHolon,
+                                 &error);
+    assert_true(emptyDescribe != nil && error == nil, @"describe empty response");
+    if (emptyDescribe != nil) {
+      assert_eq(@"empty-holon", emptyDescribe.slug, @"describe empty slug");
+      assert_eq(@"Still available.", emptyDescribe.motto, @"describe empty motto");
+      assert_true(emptyDescribe.services.count == 0, @"describe empty services");
+    }
+    [[NSFileManager defaultManager] removeItemAtPath:emptyDescribeRoot error:nil];
 
     NSString *discoverRoot = make_temp_dir(@"objc_holons_discover_");
     NSString *opRoot = make_temp_dir(@"objc_holons_op_");

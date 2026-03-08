@@ -148,6 +148,69 @@ typedef NSDictionary<NSString *, id> *_Nonnull (^HOLHolonRPCHandler)(
 @property(nonatomic, copy, nullable) NSString *portFile;
 @end
 
+typedef NS_ENUM(NSInteger, HOLFieldLabel) {
+  HOLFieldLabelUnspecified = 0,
+  HOLFieldLabelOptional = 1,
+  HOLFieldLabelRepeated = 2,
+  HOLFieldLabelMap = 3,
+  HOLFieldLabelRequired = 4,
+};
+
+@interface HOLDescribeRequest : NSObject
+@end
+
+@interface HOLEnumValueDoc : NSObject
+@property(nonatomic, copy) NSString *name;
+@property(nonatomic, assign) NSInteger number;
+@property(nonatomic, copy) NSString *docDescription;
+@end
+
+@interface HOLFieldDoc : NSObject
+@property(nonatomic, copy) NSString *name;
+@property(nonatomic, copy) NSString *type;
+@property(nonatomic, assign) NSInteger number;
+@property(nonatomic, copy) NSString *docDescription;
+@property(nonatomic, assign) HOLFieldLabel label;
+@property(nonatomic, copy) NSString *mapKeyType;
+@property(nonatomic, copy) NSString *mapValueType;
+@property(nonatomic, copy) NSArray<HOLFieldDoc *> *nestedFields;
+@property(nonatomic, copy) NSArray<HOLEnumValueDoc *> *enumValues;
+@property(nonatomic, assign) BOOL required;
+@property(nonatomic, copy) NSString *example;
+@end
+
+@interface HOLMethodDoc : NSObject
+@property(nonatomic, copy) NSString *name;
+@property(nonatomic, copy) NSString *docDescription;
+@property(nonatomic, copy) NSString *inputType;
+@property(nonatomic, copy) NSString *outputType;
+@property(nonatomic, copy) NSArray<HOLFieldDoc *> *inputFields;
+@property(nonatomic, copy) NSArray<HOLFieldDoc *> *outputFields;
+@property(nonatomic, assign) BOOL clientStreaming;
+@property(nonatomic, assign) BOOL serverStreaming;
+@property(nonatomic, copy) NSString *exampleInput;
+@end
+
+@interface HOLServiceDoc : NSObject
+@property(nonatomic, copy) NSString *name;
+@property(nonatomic, copy) NSString *docDescription;
+@property(nonatomic, copy) NSArray<HOLMethodDoc *> *methods;
+@end
+
+@interface HOLDescribeResponse : NSObject
+@property(nonatomic, copy) NSString *slug;
+@property(nonatomic, copy) NSString *motto;
+@property(nonatomic, copy) NSArray<HOLServiceDoc *> *services;
+@end
+
+typedef HOLDescribeResponse *_Nullable (^HOLDescribeHandler)(HOLDescribeRequest *_Nonnull request);
+
+@interface HOLHolonMetaRegistration : NSObject
+@property(nonatomic, copy) NSString *serviceName;
+@property(nonatomic, copy) NSString *methodName;
+@property(nonatomic, copy) HOLDescribeHandler handler;
+@end
+
 @interface Holons : NSObject
 + (nullable GRPCChannel *)connect:(NSString *)target;
 + (nullable GRPCChannel *)connect:(NSString *)target options:(HolonsConnectOptions *)options;
@@ -202,6 +265,16 @@ HOLHolonEntry *_Nullable HOLFindBySlug(NSString *slug, NSError *_Nullable *_Null
 
 /// Find a holon by UUID prefix across local, $OPBIN, and cache search roots.
 HOLHolonEntry *_Nullable HOLFindByUUID(NSString *prefix, NSError *_Nullable *_Nullable error);
+
+/// Build a HolonMeta Describe response from local proto files and holon.yaml.
+HOLDescribeResponse *_Nullable HOLBuildDescribeResponse(
+    NSString *protoDir,
+    NSString *holonYamlPath,
+    NSError *_Nullable *_Nullable error);
+
+/// Create a manual HolonMeta registration for SDKs without a full serve runner.
+HOLHolonMetaRegistration *HOLMakeHolonMetaRegistration(NSString *protoDir,
+                                                       NSString *holonYamlPath);
 
 /// Close any open descriptors associated with a listener.
 void HOLCloseListener(HOLTransportListener *listener);

@@ -7,7 +7,7 @@ client.
 ## Build & Test
 
 ```bash
-clang -framework Foundation -I include src/Holons.m test/holons_test.m -o test_runner && ./test_runner
+clang -framework Foundation -I include src/Holons.m src/HolonMeta.m test/holons_test.m -o test_runner && ./test_runner
 ```
 
 ## API surface
